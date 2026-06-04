@@ -795,7 +795,7 @@ async fn delete_my_token(
 }
 
 #[utoipa::path(
-    get,
+    method(get, head, post, put, delete, options),
     path = "/forward-auth",
     tag = "forward-auth",
     responses(

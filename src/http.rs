@@ -79,12 +79,14 @@ fn build_router(
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/frontend/config", get(frontend_config))
-        .route("/forward-auth",
+        .route(
+            "/forward-auth",
             get(forward_auth)
-            .post(forward_auth)
-            .put(forward_auth)
-            .delete(forward_auth)
-            .options(forward_auth))
+                .post(forward_auth)
+                .put(forward_auth)
+                .delete(forward_auth)
+                .options(forward_auth),
+        )
         .merge(Scalar::with_url("/docs", openapi));
 
     let auth_state = state.auth.clone();

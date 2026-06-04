@@ -79,7 +79,12 @@ fn build_router(
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/frontend/config", get(frontend_config))
-        .route("/forward-auth", get(forward_auth))
+        .route("/forward-auth",
+            get(forward_auth)
+            .post(forward_auth)
+            .put(forward_auth)
+            .delete(forward_auth)
+            .options(forward_auth))
         .merge(Scalar::with_url("/docs", openapi));
 
     let auth_state = state.auth.clone();
@@ -1551,5 +1556,65 @@ mod tests {
             .await
             .expect_err("should reject");
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_auth_accepts_get_and_post_methods() {
+        use tower::ServiceExt;
+
+        let client = setup_test_client().await;
+        let state = build_state_with_oauth(client.clone()).await;
+        let app = build_router(state, None, None);
+
+        let sub = format!("user_{}", test_suffix());
+        let token = "forward-method-test";
+        let hash = hash_token(token, &TEST_TOKEN_SALT);
+
+        let _ = storage::delete_api_token(&client, &hash).await;
+        storage::create_api_token(&client, &sub, &hash, "")
+            .await
+            .expect("store token");
+
+        let auth_value = format!("bearer {}", token);
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/forward-auth")
+                    .header(header::AUTHORIZATION, &auth_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("GET request failed");
+
+        assert_eq!(
+            get_response.status(),
+            StatusCode::NO_CONTENT,
+            "GET /forward-auth should return 204"
+        );
+
+        let post_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/forward-auth")
+                    .header(header::AUTHORIZATION, &auth_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("POST request failed");
+
+        assert_eq!(
+            post_response.status(),
+            StatusCode::NO_CONTENT,
+            "POST /forward-auth should return 204"
+        );
+
+        cleanup_token(&client, &hash, &sub).await;
     }
 }

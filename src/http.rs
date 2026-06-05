@@ -847,6 +847,7 @@ async fn forward_auth(
         .status(StatusCode::NO_CONTENT)
         .header("X-Authenticated-User", sub.as_str())
         .header("X-Authenticated-Token-Id", token_hash.as_str())
+        .header("X-User-ID", sub.as_str()) // header for agentgateway
         .body(Body::empty())
         .map_err(|_| ApiError::internal("failed to build response"))
 }

@@ -220,6 +220,14 @@ async fn require_admin(
 
     if !is_admin {
         warn!(subject = subject, "admin privileges required");
+        let claims_extra = format!("{:?}", claims_ref.extra);
+        warn!(
+            subject = subject,
+            iss = ?claims_ref.iss,
+            aud = ?claims_ref.aud,
+            claims = claims_extra,
+            "admin privileges required"
+        );
         return Err(ApiError::forbidden("admin privileges required"));
     }
 

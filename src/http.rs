@@ -1154,6 +1154,18 @@ mod tests {
         }
     }
 
+    async fn build_state_with_oauth_and_api_key(
+        client: fred::clients::Client,
+        api_key: &str,
+    ) -> AppState {
+        AppState {
+            client,
+            token_salt: TEST_TOKEN_SALT,
+            auth: Arc::new(auth::AuthState::with_oauth_and_admin_api_key_for_tests(api_key).await),
+            frontend: test_frontend_config(),
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn build_router_registers_routes_without_panic() {
@@ -1720,74 +1732,199 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn admin_api_key_grants_access_to_admin_routes() {
+    async fn admin_api_key_only_accepts_correct_key() {
         use tower::ServiceExt;
 
-        const STATIC_KEY: &str = "super-secret-admin-key";
+        const KEY: &str = "super-secret-admin-key";
 
         let client = setup_test_client().await;
-        let state = build_state_with_api_key(client.clone(), STATIC_KEY);
-        let app = build_router(state, None, None);
+        let app = build_router(build_state_with_api_key(client.clone(), KEY), None, None);
 
         let sub = format!("user_{}", test_suffix());
         let token = "admin-key-token";
         let hash = hash_token(token, &TEST_TOKEN_SALT);
-
         let _ = storage::delete_api_token(&client, &hash).await;
         storage::create_api_token(&client, &sub, &hash, "")
             .await
             .expect("store token");
 
-        let response = app
+        let no_auth = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
                     .uri(format!("/api/users/{}/tokens", sub))
-                    .header(header::AUTHORIZATION, format!("Bearer {}", STATIC_KEY))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
-            .expect("request failed");
+            .unwrap();
+        assert_eq!(no_auth.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "valid admin API key should grant 200 on admin route"
-        );
+        let wrong_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/users/{}/tokens", sub))
+                    .header(header::AUTHORIZATION, "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_key.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let correct_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/users/{}/tokens", sub))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", KEY))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(correct_key.status(), StatusCode::OK);
 
         cleanup_token(&client, &hash, &sub).await;
     }
 
     #[tokio::test]
     #[serial]
-    async fn admin_api_key_rejects_wrong_key() {
+    async fn admin_api_key_with_oauth_accepts_correct_key_and_rejects_invalid() {
         use tower::ServiceExt;
 
-        const STATIC_KEY: &str = "correct-admin-key";
+        const KEY: &str = "correct-admin-key";
 
         let client = setup_test_client().await;
-        let state = build_state_with_api_key(client.clone(), STATIC_KEY);
-        let app = build_router(state, None, None);
+        let app = build_router(
+            build_state_with_oauth_and_api_key(client.clone(), KEY).await,
+            None,
+            None,
+        );
 
         let sub = format!("user_{}", test_suffix());
+        let token = "admin-oauth-key-token";
+        let hash = hash_token(token, &TEST_TOKEN_SALT);
+        let _ = storage::delete_api_token(&client, &hash).await;
+        storage::create_api_token(&client, &sub, &hash, "")
+            .await
+            .expect("store token");
 
-        let response = app
+        let no_auth = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
                     .uri(format!("/api/users/{}/tokens", sub))
-                    .header(header::AUTHORIZATION, "Bearer wrong-key")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
-            .expect("request failed");
+            .unwrap();
+        assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
 
-        assert_eq!(
-            response.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "wrong key should be rejected (oauth not configured, so 500)"
-        );
+        let wrong_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/users/{}/tokens", sub))
+                    .header(header::AUTHORIZATION, "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_key.status(), StatusCode::UNAUTHORIZED);
+
+        let correct_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/users/{}/tokens", sub))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", KEY))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(correct_key.status(), StatusCode::OK);
+
+        cleanup_token(&client, &hash, &sub).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn admin_api_key_create_and_delete_cycle() {
+        use tower::ServiceExt;
+
+        const KEY: &str = "crud-admin-key";
+
+        let client = setup_test_client().await;
+        let sub = format!("user_{}", test_suffix());
+        let app = build_router(build_state_with_api_key(client.clone(), KEY), None, None);
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/users/{}/tokens", sub))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", KEY))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{\"description\":\"test\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+
+        let body_bytes = to_bytes(create_response.into_body(), 4096)
+            .await
+            .expect("body");
+        let created: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid json");
+        let token_id = created["id"].as_str().expect("id field").to_string();
+        let raw_token = created["token"].as_str().expect("token field").to_string();
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/users/{}/tokens", sub))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", KEY))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_bytes = to_bytes(list_response.into_body(), 4096)
+            .await
+            .expect("body");
+        let list: serde_json::Value = serde_json::from_slice(&list_bytes).expect("valid json");
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        let delete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/users/{}/tokens/{}", sub, token_id))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", KEY))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+        let hash = hash_token(&raw_token, &TEST_TOKEN_SALT);
+        cleanup_token(&client, &hash, &sub).await;
     }
 }

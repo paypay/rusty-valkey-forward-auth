@@ -152,6 +152,13 @@ impl AuthState {
     }
 
     #[cfg(test)]
+    pub async fn with_oauth_and_admin_api_key_for_tests(key: &str) -> Self {
+        let mut state = Self::for_tests_with_layer().await;
+        state.admin_api_key_hash = Some(*blake3::hash(key.as_bytes()).as_bytes());
+        state
+    }
+
+    #[cfg(test)]
     pub async fn for_tests_with_layer() -> Self {
         const TEST_JWKS: &str = r#"{
   "keys": [
@@ -483,5 +490,25 @@ mod tests {
         };
 
         assert!(config.has_admin_group(&claims));
+    }
+
+    #[test]
+    fn admin_api_key_validates_correct_key() {
+        let state = AuthState::with_admin_api_key_for_tests("secret");
+        assert!(state.has_admin_api_key());
+        assert!(state.is_valid_admin_api_key("secret"));
+    }
+
+    #[test]
+    fn admin_api_key_rejects_wrong_key() {
+        let state = AuthState::with_admin_api_key_for_tests("secret");
+        assert!(!state.is_valid_admin_api_key("wrong"));
+    }
+
+    #[test]
+    fn has_admin_api_key_is_false_when_not_configured() {
+        let state = AuthState::disabled_for_tests();
+        assert!(!state.has_admin_api_key());
+        assert!(!state.is_valid_admin_api_key("anything"));
     }
 }

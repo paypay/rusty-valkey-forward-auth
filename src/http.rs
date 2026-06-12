@@ -18,10 +18,14 @@ use rand::TryRng;
 use rand::rngs::SysRng;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
+use tower::Service;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_helmet::HelmetLayer;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
@@ -94,10 +98,17 @@ fn build_router(
     let auth_state = state.auth.clone();
     let oauth_layer = auth_state.oauth_layer();
 
-    // Admin routes are always protected by the require_admin middleware.
-    // If an OAuth layer is also available it is applied on top so that JWT
-    // claims are populated before the middleware runs.
-    let mut admin_router = Router::new()
+    let bare_admin_router = Router::new()
+        .route("/users/{sub}/tokens", get(list_tokens).post(create_token))
+        .route("/users/{sub}/tokens/{id}", delete(delete_token))
+        .layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            require_admin,
+        ))
+        .layer(HelmetLayer::with_defaults())
+        .with_state(state.clone());
+
+    let mut oauth_admin_router = Router::new()
         .route("/users/{sub}/tokens", get(list_tokens).post(create_token))
         .route("/users/{sub}/tokens/{id}", delete(delete_token))
         .layer(middleware::from_fn_with_state(
@@ -105,13 +116,18 @@ fn build_router(
             require_admin,
         ));
     if let Some(ref layer) = oauth_layer {
-        admin_router = admin_router.layer(layer.clone());
+        oauth_admin_router = oauth_admin_router.layer(layer.clone());
     }
-    let admin_router = admin_router.layer(HelmetLayer::with_defaults());
+    let oauth_admin_router = oauth_admin_router
+        .layer(HelmetLayer::with_defaults())
+        .with_state(state.clone());
 
-    // User (self-service) routes require a valid OAuth token.
-    // When OAuth is not configured these routes are unavailable — require_admin
-    // would reject them anyway since they rely on JWT-derived subjects.
+    let admin_service = AdminKeyDispatcher {
+        auth: auth_state.clone(),
+        key_router: bare_admin_router,
+        oauth_router: oauth_admin_router,
+    };
+
     let user_router = if let Some(ref layer) = oauth_layer {
         Router::new()
             .route("/tokens", get(list_my_tokens).post(create_my_token))
@@ -123,7 +139,7 @@ fn build_router(
     };
 
     router = router
-        .nest("/api", admin_router)
+        .nest_service("/api", admin_service)
         .nest("/api/me", user_router);
 
     if let Some(static_dir) = static_dir {
@@ -209,21 +225,64 @@ fn cors_layer_from_config(config: &CorsConfig) -> anyhow::Result<Option<CorsLaye
     Ok(Some(layer))
 }
 
+#[derive(Clone)]
+struct AdminApiKeyVerified;
+
+#[derive(Clone)]
+struct AdminKeyDispatcher<K, O> {
+    auth: Arc<auth::AuthState>,
+    key_router: K,
+    oauth_router: O,
+}
+
+impl<K, O> Service<Request<Body>> for AdminKeyDispatcher<K, O>
+where
+    K: Service<Request<Body>, Response = Response, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    K::Future: Send + 'static,
+    O: Service<Request<Body>, Response = Response, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    O::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = std::convert::Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, std::convert::Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        let _ = self.key_router.poll_ready(cx);
+        let _ = self.oauth_router.poll_ready(cx);
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        let use_key_router = self.auth.has_admin_api_key()
+            && extract_token(req.headers())
+                .as_deref()
+                .is_some_and(|token| self.auth.is_valid_admin_api_key(token));
+
+        if use_key_router {
+            req.extensions_mut().insert(AdminApiKeyVerified);
+            Box::pin(self.key_router.call(req))
+        } else {
+            Box::pin(self.oauth_router.call(req))
+        }
+    }
+}
+
 async fn require_admin(
     State(auth_state): State<Arc<auth::AuthState>>,
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // Fast path: static admin API key.
-    if auth_state.has_admin_api_key()
-        && let Some(token) = extract_token(req.headers())
-        && auth_state.is_valid_admin_api_key(&token)
-    {
+    if req.extensions().get::<AdminApiKeyVerified>().is_some() {
         debug!("admin access granted via static API key");
         return Ok(next.run(req).await);
     }
 
-    // OAuth path.
     if !auth_state.is_enabled() {
         warn!("admin middleware invoked without oauth configuration");
         return Err(ApiError::internal("oauth not configured for admin routes"));
@@ -241,7 +300,6 @@ async fn require_admin(
     let is_admin = auth_state.user_has_admin_access(claims_ref);
 
     if !is_admin {
-        warn!(subject = subject, "admin privileges required");
         let claims_extra = format!("{:?}", claims_ref.extra);
         warn!(
             subject = subject,

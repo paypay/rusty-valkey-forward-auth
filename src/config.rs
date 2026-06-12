@@ -79,7 +79,6 @@ impl RVFAConfig {
             config.token_salt = DEFAULT_TOKEN_SALT_HEX.to_string();
         }
 
-        // Normalize empty ADMIN_API_KEY to None.
         if let Some(key) = &config.admin_api_key
             && key.trim().is_empty()
         {

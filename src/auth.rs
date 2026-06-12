@@ -16,7 +16,6 @@ use crate::config::{OAuthAdminConfig, OAuthClaimsConfig, OAuthConfig};
 pub struct AuthState {
     claim_config: ClaimConfig,
     backend: Option<OAuthBackend>,
-    /// Blake3 hash of the static admin API key, if one was configured.
     admin_api_key_hash: Option<[u8; 32]>,
 }
 
@@ -29,7 +28,6 @@ impl AuthState {
             .map(|key| *blake3::hash(key.as_bytes()).as_bytes());
 
         if admin_api_key_hash.is_none() {
-            // No static key — OAuth must be fully operational.
             if claim_config.admin_group.is_none() {
                 return Err(anyhow!(
                     "oauth.admin.group must be set to enforce admin permissions"
@@ -49,8 +47,6 @@ impl AuthState {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        // Build the OAuth backend only when an issuer is configured.  When only
-        // a static admin API key is set the OAuth stack is optional.
         let backend = if let Some(issuer) = issuer {
             let mut tenant_builder = TenantConfiguration::builder(issuer);
             if let Some(identifier) = config
@@ -126,9 +122,6 @@ impl AuthState {
         self.claim_config.has_admin_group(claims)
     }
 
-    /// Returns `true` when a static admin API key is configured and the supplied
-    /// `key` matches it.  The comparison is done against a stored blake3 hash so
-    /// the plaintext key is never kept in memory beyond initial startup.
     pub fn is_valid_admin_api_key(&self, key: &str) -> bool {
         match &self.admin_api_key_hash {
             Some(expected) => blake3::hash(key.as_bytes()).as_bytes() == expected,
@@ -136,7 +129,6 @@ impl AuthState {
         }
     }
 
-    /// Returns `true` when a static admin API key has been configured.
     pub fn has_admin_api_key(&self) -> bool {
         self.admin_api_key_hash.is_some()
     }

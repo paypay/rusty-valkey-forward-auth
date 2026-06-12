@@ -42,6 +42,12 @@ pub(crate) struct RVFAConfig {
     #[config(nested)]
     pub oauth: OAuthConfig,
 
+    /// Static API key that grants admin access to `/api/users/*` routes.
+    /// When set, a request bearing this value as a Bearer token is treated as an admin
+    /// without requiring OAuth2 validation.  Keep this secret.
+    #[config(env = "ADMIN_API_KEY")]
+    pub admin_api_key: Option<String>,
+
     /// Directory containing pre-built frontend assets to serve at `/`.
     #[config(env = "STATIC_DIR")]
     pub static_dir: Option<PathBuf>,
@@ -71,6 +77,13 @@ impl RVFAConfig {
 
         if config.token_salt.trim().is_empty() {
             config.token_salt = DEFAULT_TOKEN_SALT_HEX.to_string();
+        }
+
+        // Normalize empty ADMIN_API_KEY to None.
+        if let Some(key) = &config.admin_api_key
+            && key.trim().is_empty()
+        {
+            config.admin_api_key = None;
         }
 
         if config

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use axum::body::Body;
 use serde::Deserialize;
 use serde_json::Value;
@@ -16,77 +16,97 @@ use crate::config::{OAuthAdminConfig, OAuthClaimsConfig, OAuthConfig};
 pub struct AuthState {
     claim_config: ClaimConfig,
     backend: Option<OAuthBackend>,
+    /// Blake3 hash of the static admin API key, if one was configured.
+    admin_api_key_hash: Option<[u8; 32]>,
 }
 
 impl AuthState {
-    pub async fn from_config(config: &OAuthConfig) -> Result<Self> {
+    pub async fn from_config(config: &OAuthConfig, admin_api_key: Option<&str>) -> Result<Self> {
         let claim_config = ClaimConfig::from_configs(&config.claims, &config.admin);
 
-        if claim_config.admin_group.is_none() {
-            return Err(anyhow!(
-                "oauth.admin.group must be set to enforce admin permissions"
-            ));
-        }
+        let admin_api_key_hash = admin_api_key
+            .filter(|key| !key.trim().is_empty())
+            .map(|key| *blake3::hash(key.as_bytes()).as_bytes());
 
-        if claim_config.groups_claim.is_none() {
-            return Err(anyhow!(
-                "oauth.claims.groups must be configured to validate admin membership"
-            ));
+        if admin_api_key_hash.is_none() {
+            // No static key — OAuth must be fully operational.
+            if claim_config.admin_group.is_none() {
+                return Err(anyhow!(
+                    "oauth.admin.group must be set to enforce admin permissions"
+                ));
+            }
+
+            if claim_config.groups_claim.is_none() {
+                return Err(anyhow!(
+                    "oauth.claims.groups must be configured to validate admin membership"
+                ));
+            }
         }
 
         let issuer = config
             .issuer_url
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("oauth.issuer_url must be configured")?;
+            .filter(|value| !value.is_empty());
 
-        let mut tenant_builder = TenantConfiguration::builder(issuer);
-        if let Some(identifier) = config
-            .tenant_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            tenant_builder = tenant_builder.identifier(identifier);
-        }
-        if let Some(jwks_url) = config
-            .jwks_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            tenant_builder = tenant_builder.jwks_url(jwks_url);
-        }
-        tenant_builder = tenant_builder
-            .jwks_refresh_interval(Duration::from_secs(config.jwks_refresh_interval_secs));
-
-        if !config.audiences.is_empty() {
-            let audiences = config
-                .audiences
-                .iter()
-                .map(|aud| aud.trim())
-                .filter(|aud| !aud.is_empty())
-                .collect::<Vec<_>>();
-            if !audiences.is_empty() {
-                tenant_builder = tenant_builder.audiences(&audiences);
+        // Build the OAuth backend only when an issuer is configured.  When only
+        // a static admin API key is set the OAuth stack is optional.
+        let backend = if let Some(issuer) = issuer {
+            let mut tenant_builder = TenantConfiguration::builder(issuer);
+            if let Some(identifier) = config
+                .tenant_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                tenant_builder = tenant_builder.identifier(identifier);
             }
-        }
+            if let Some(jwks_url) = config
+                .jwks_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                tenant_builder = tenant_builder.jwks_url(jwks_url);
+            }
+            tenant_builder = tenant_builder
+                .jwks_refresh_interval(Duration::from_secs(config.jwks_refresh_interval_secs));
 
-        let tenant = tenant_builder
-            .build()
-            .await
-            .map_err(|err| anyhow!("failed to build OAuth tenant: {err}"))?;
+            if !config.audiences.is_empty() {
+                let audiences = config
+                    .audiences
+                    .iter()
+                    .map(|aud| aud.trim())
+                    .filter(|aud| !aud.is_empty())
+                    .collect::<Vec<_>>();
+                if !audiences.is_empty() {
+                    tenant_builder = tenant_builder.audiences(&audiences);
+                }
+            }
 
-        let server = OAuth2ResourceServer::<AuthClaims>::builder()
-            .add_tenant(tenant)
-            .build()
-            .await
-            .map_err(|err| anyhow!("failed to construct OAuth2 resource server: {err}"))?;
+            let tenant = tenant_builder
+                .build()
+                .await
+                .map_err(|err| anyhow!("failed to build OAuth tenant: {err}"))?;
+
+            let server = OAuth2ResourceServer::<AuthClaims>::builder()
+                .add_tenant(tenant)
+                .build()
+                .await
+                .map_err(|err| anyhow!("failed to construct OAuth2 resource server: {err}"))?;
+
+            Some(OAuthBackend::new(server))
+        } else {
+            if admin_api_key_hash.is_none() {
+                return Err(anyhow!("oauth.issuer_url must be configured"));
+            }
+            None
+        };
 
         Ok(Self {
             claim_config,
-            backend: Some(OAuthBackend::new(server)),
+            backend,
+            admin_api_key_hash,
         })
     }
 
@@ -106,11 +126,36 @@ impl AuthState {
         self.claim_config.has_admin_group(claims)
     }
 
+    /// Returns `true` when a static admin API key is configured and the supplied
+    /// `key` matches it.  The comparison is done against a stored blake3 hash so
+    /// the plaintext key is never kept in memory beyond initial startup.
+    pub fn is_valid_admin_api_key(&self, key: &str) -> bool {
+        match &self.admin_api_key_hash {
+            Some(expected) => blake3::hash(key.as_bytes()).as_bytes() == expected,
+            None => false,
+        }
+    }
+
+    /// Returns `true` when a static admin API key has been configured.
+    pub fn has_admin_api_key(&self) -> bool {
+        self.admin_api_key_hash.is_some()
+    }
+
     #[cfg(test)]
     pub fn disabled_for_tests() -> Self {
         Self {
             claim_config: ClaimConfig::default(),
             backend: None,
+            admin_api_key_hash: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_admin_api_key_for_tests(key: &str) -> Self {
+        Self {
+            claim_config: ClaimConfig::default(),
+            backend: None,
+            admin_api_key_hash: Some(*blake3::hash(key.as_bytes()).as_bytes()),
         }
     }
 
@@ -150,6 +195,7 @@ impl AuthState {
         Self {
             claim_config,
             backend: Some(OAuthBackend::new(server)),
+            admin_api_key_hash: None,
         }
     }
 }

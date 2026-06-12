@@ -43,7 +43,9 @@ pub struct AppState {
 
 pub async fn serve(config: &RVFAConfig, client: fred::clients::Client) -> anyhow::Result<()> {
     let token_salt = config.token_salt_bytes()?;
-    let auth_state = Arc::new(auth::AuthState::from_config(&config.oauth).await?);
+    let auth_state = Arc::new(
+        auth::AuthState::from_config(&config.oauth, config.admin_api_key.as_deref()).await?,
+    );
     let cors_layer = cors_layer_from_config(&config.cors)?;
     let frontend_config = config.frontend.public_view();
     let state = AppState {
@@ -90,25 +92,35 @@ fn build_router(
         .merge(Scalar::with_url("/docs", openapi));
 
     let auth_state = state.auth.clone();
-    let oauth_layer = auth_state
-        .oauth_layer()
-        .expect("OAuth2 resource server must be configured");
+    let oauth_layer = auth_state.oauth_layer();
 
-    let admin_router = Router::new()
+    // Admin routes are always protected by the require_admin middleware.
+    // If an OAuth layer is also available it is applied on top so that JWT
+    // claims are populated before the middleware runs.
+    let mut admin_router = Router::new()
         .route("/users/{sub}/tokens", get(list_tokens).post(create_token))
         .route("/users/{sub}/tokens/{id}", delete(delete_token))
         .layer(middleware::from_fn_with_state(
             auth_state.clone(),
             require_admin,
-        ))
-        .layer(oauth_layer.clone())
-        .layer(HelmetLayer::with_defaults());
+        ));
+    if let Some(ref layer) = oauth_layer {
+        admin_router = admin_router.layer(layer.clone());
+    }
+    let admin_router = admin_router.layer(HelmetLayer::with_defaults());
 
-    let user_router = Router::new()
-        .route("/tokens", get(list_my_tokens).post(create_my_token))
-        .route("/tokens/{id}", delete(delete_my_token))
-        .layer(oauth_layer)
-        .layer(HelmetLayer::with_defaults());
+    // User (self-service) routes require a valid OAuth token.
+    // When OAuth is not configured these routes are unavailable — require_admin
+    // would reject them anyway since they rely on JWT-derived subjects.
+    let user_router = if let Some(ref layer) = oauth_layer {
+        Router::new()
+            .route("/tokens", get(list_my_tokens).post(create_my_token))
+            .route("/tokens/{id}", delete(delete_my_token))
+            .layer(layer.clone())
+            .layer(HelmetLayer::with_defaults())
+    } else {
+        Router::new()
+    };
 
     router = router
         .nest("/api", admin_router)
@@ -202,6 +214,16 @@ async fn require_admin(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // Fast path: static admin API key.
+    if auth_state.has_admin_api_key()
+        && let Some(token) = extract_token(req.headers())
+        && auth_state.is_valid_admin_api_key(&token)
+    {
+        debug!("admin access granted via static API key");
+        return Ok(next.run(req).await);
+    }
+
+    // OAuth path.
     if !auth_state.is_enabled() {
         warn!("admin middleware invoked without oauth configuration");
         return Err(ApiError::internal("oauth not configured for admin routes"));
@@ -1056,6 +1078,15 @@ mod tests {
         }
     }
 
+    fn build_state_with_api_key(client: fred::clients::Client, api_key: &str) -> AppState {
+        AppState {
+            client,
+            token_salt: TEST_TOKEN_SALT,
+            auth: Arc::new(auth::AuthState::with_admin_api_key_for_tests(api_key)),
+            frontend: test_frontend_config(),
+        }
+    }
+
     async fn build_state_with_oauth(client: fred::clients::Client) -> AppState {
         AppState {
             client,
@@ -1627,5 +1658,78 @@ mod tests {
         );
 
         cleanup_token(&client, &hash, &sub).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn admin_api_key_grants_access_to_admin_routes() {
+        use tower::ServiceExt;
+
+        const STATIC_KEY: &str = "super-secret-admin-key";
+
+        let client = setup_test_client().await;
+        let state = build_state_with_api_key(client.clone(), STATIC_KEY);
+        let app = build_router(state, None, None);
+
+        let sub = format!("user_{}", test_suffix());
+        let token = "admin-key-token";
+        let hash = hash_token(token, &TEST_TOKEN_SALT);
+
+        let _ = storage::delete_api_token(&client, &hash).await;
+        storage::create_api_token(&client, &sub, &hash, "")
+            .await
+            .expect("store token");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/users/{}/tokens", sub))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", STATIC_KEY))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "valid admin API key should grant 200 on admin route"
+        );
+
+        cleanup_token(&client, &hash, &sub).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn admin_api_key_rejects_wrong_key() {
+        use tower::ServiceExt;
+
+        const STATIC_KEY: &str = "correct-admin-key";
+
+        let client = setup_test_client().await;
+        let state = build_state_with_api_key(client.clone(), STATIC_KEY);
+        let app = build_router(state, None, None);
+
+        let sub = format!("user_{}", test_suffix());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/users/{}/tokens", sub))
+                    .header(header::AUTHORIZATION, "Bearer wrong-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "wrong key should be rejected (oauth not configured, so 500)"
+        );
     }
 }

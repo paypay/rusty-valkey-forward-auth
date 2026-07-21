@@ -35,6 +35,10 @@ pub(crate) struct RVFAConfig {
     #[config(env = "VALKEY_DATABASE_ID", default = 0)]
     pub valkey_database_id: u8,
 
+    /// Additional trusted TLS CA certificates for valkeys:// URLs
+    #[config(env = "VALKEY_TLS_CA")]
+    pub valkey_tls_ca: Option<String>,
+
     /// Token hashing salt (32 bytes hex-encoded, 64 characters). Used as the keyed blake3 salt.
     /// IMPORTANT: Keep this secret and consistent across deployments.
     #[config(env = "TOKEN_SALT")]

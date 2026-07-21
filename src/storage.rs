@@ -4,8 +4,8 @@ use fred::prelude::*;
 use fred::rustls::pki_types::CertificateDer;
 use fred::rustls::pki_types::pem::PemObject;
 use std::time::Duration;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TokenInfo {
@@ -38,7 +38,10 @@ pub(crate) async fn client_from_config(config: &RVFAConfig) -> Result<fred::clie
             tracing::warn!("failed to load a native root certificate: {err:?}");
         }
         if native.certs.is_empty() && !native.errors.is_empty() {
-            anyhow::bail!("failed to load any native root certificates: {:?}", native.errors);
+            anyhow::bail!(
+                "failed to load any native root certificates: {:?}",
+                native.errors
+            );
         }
 
         for cert in native.certs {
@@ -48,8 +51,8 @@ pub(crate) async fn client_from_config(config: &RVFAConfig) -> Result<fred::clie
         for cert in CertificateDer::pem_file_iter(ca_path)
             .with_context(|| format!("failed to read valkey_tls_ca file {ca_path}"))?
         {
-            let cert = cert
-                .with_context(|| format!("failed to parse PEM certificate in {ca_path}"))?;
+            let cert =
+                cert.with_context(|| format!("failed to parse PEM certificate in {ca_path}"))?;
             root_store.add(cert)?;
         }
 

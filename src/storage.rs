@@ -1,6 +1,8 @@
 use crate::config::RVFAConfig;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fred::prelude::*;
+use fred::rustls::pki_types::CertificateDer;
+use fred::rustls::pki_types::pem::PemObject;
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -27,6 +29,41 @@ pub(crate) async fn client_from_config(config: &RVFAConfig) -> Result<fred::clie
     if let Some(password) = &config.valkey_password {
         valkey_config.password = Some(password.clone());
     }
+
+    if let Some(ca_path) = &config.valkey_tls_ca {
+        let mut root_store = fred::rustls::RootCertStore::empty();
+
+        let native = fred::rustls_native_certs::load_native_certs();
+        for err in &native.errors {
+            tracing::warn!("failed to load a native root certificate: {err:?}");
+        }
+        if native.certs.is_empty() && !native.errors.is_empty() {
+            anyhow::bail!(
+                "failed to load any native root certificates: {:?}",
+                native.errors
+            );
+        }
+
+        for cert in native.certs {
+            root_store.add(cert)?;
+        }
+
+        for cert in CertificateDer::pem_file_iter(ca_path)
+            .with_context(|| format!("failed to read valkey_tls_ca file {ca_path}"))?
+        {
+            let cert =
+                cert.with_context(|| format!("failed to parse PEM certificate in {ca_path}"))?;
+            root_store.add(cert)?;
+        }
+
+        let client_config = fred::rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let tls_connector: fred::types::config::TlsConnector = client_config.into();
+        valkey_config.tls = Some(tls_connector.into());
+    }
+
     valkey_config.database = Some(config.valkey_database_id);
     let client = Builder::from_config(valkey_config)
         .with_connection_config(|connection_config| {
